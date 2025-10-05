@@ -1,58 +1,31 @@
-# atlasify_selected_object.py
-# ------------------------------------------------------------
-# Universal "no-bake" atlas builder for the ACTIVE object.
-# - Duplicates the active object ("<name>_ATLAS")
-# - Builds one BaseColor atlas + one Normal atlas from material slots
-# - Creates a single material wired to those atlases
-# - Adds a BAKE_ATLAS UV that remaps original UVs into each tile
-# - Preserves per-slot UVs (scales/offsets them into non-overlapping regions)
-#
-# REQUIREMENTS
-# - Blender 3.6+ (tested 4.x)
-# - Pillow (PIL) available in Blender's Python:
-#     Blender's Python Console ->
-#         import ensurepip, pip; ensurepip.bootstrap(); pip.main(['install','pillow'])
-#
-# USAGE
-# 1) Select your object (it must have material slots A..N, each a Principled BSDF with:
-#       - Base Color fed by an Image Texture
-#       - Normal fed by a Normal Map node which is fed by an Image Texture (optional)
-#    Packed images are supported; they'll be saved temporarily as PNG.
-# 2) Open Scripting, paste this file contents, edit OPTIONS below if needed, Run Script.
-# 3) You'll get "<Object>_ATLAS" with one material, two atlas images, and BAKE_ATLAS UV.
-#
-# LIMITATIONS
-# - If slot images differ wildly in aspect/size, they will be uniformly resized to TILE_WxTILE_H.
-# - Normal atlas is tangent-space; if a slot has no normal, a flat (128,128,255) tile is used.
-# - Node detection is heuristic but robust for common setups.
-# ------------------------------------------------------------
+# atlasify_selected_object_v2.py
+# Universal no-bake atlas builder (patched resampling for Pillow 10+).
 
 import bpy, bmesh, os, math, json, tempfile
 
 # ---- OPTIONS ------------------------------------------------
-OUTPUT_DIR = None  # None => beside the .blend; else absolute path e.g. r"D:\atlas_out"
-ATLAS_BASENAME = None  # None => derived from object name
-PADDING_PX = 32        # gap between tiles in pixels
-TILE_W = None          # per-tile width; None => max source width
-TILE_H = None          # per-tile height; None => max source height
-FORCE_POW2 = True      # snap atlas width/height to next power-of-two
+OUTPUT_DIR = None
+ATLAS_BASENAME = None
+PADDING_PX = 32
+TILE_W = None
+TILE_H = None
+FORCE_POW2 = True
 RESAMPLE = 'LANCZOS'   # 'NEAREST' | 'BILINEAR' | 'BICUBIC' | 'LANCZOS'
-LAYOUT = 'auto'        # 'auto' (near-square) | 'row' | 'col' | (rows, cols) tuple
-SRC_UV_NAME = None     # None => use active_render UV; else exact UV name
+LAYOUT = 'auto'        # 'auto' | 'row' | 'col' | (rows, cols)
+SRC_UV_NAME = None
 MATERIAL_NAME = 'AtlasMaterial'
 UV_NAME = 'BAKE_ATLAS'
 # -------------------------------------------------------------
 
-# ---- Pillow loader (with friendly error) --------------------
 def _get_pil():
     try:
         from PIL import Image, ImageOps
         return Image, ImageOps
     except Exception as e:
         raise RuntimeError(
-            'Pillow (PIL) is required. In Blender\'s Python Console run:\n'
-            "import ensurepip, pip; ensurepip.bootstrap(); pip.main(['install','pillow'])"
-            f"\nOriginal import error: {e}"
+            "Pillow (PIL) is required. In Blender's Python Console run:\n"
+            "import ensurepip, pip; ensurepip.bootstrap(); pip.main(['install','pillow'])\n"
+            f"Original import error: {e}"
         )
 
 def _get_scene_dir():
@@ -64,22 +37,18 @@ def _abspath(path):
     return bpy.path.abspath(path) if path else ''
 
 def _image_to_path(img, out_dir):
-    """Return a disk path for the image data; saves packed images as PNG if needed."""
     os.makedirs(out_dir, exist_ok=True)
     name = (img.name or 'Image').replace('.', '_').replace(' ', '_')
     out_path = os.path.join(out_dir, f"{name}.png")
     try:
-        # If already has a source path on disk, prefer it
         src = _abspath(img.filepath)
         if src and os.path.exists(src):
             return src
-        # Otherwise save a copy
         img.filepath_raw = out_path
         img.file_format = 'PNG'
         img.save()
         return out_path
     except Exception:
-        # Fallback: save_render (uses scene settings)
         try:
             img.save_render(out_path)
             return out_path
@@ -88,7 +57,8 @@ def _image_to_path(img, out_dir):
 
 def _pow2(n):
     p = 1
-    while p < n: p <<= 1
+    while p < n:
+        p <<= 1
     return p
 
 def _choose_layout(n):
@@ -99,20 +69,33 @@ def _choose_layout(n):
         return 1, n
     if LAYOUT == 'col':
         return n, 1
-    # auto: near-square
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
     return rows, cols
 
-def _resample_mode(pil):
-    return {
-        'NEAREST': pil.Image.NEAREST,
-        'BILINEAR': pil.Image.BILINEAR,
-        'BICUBIC': pil.Image.BICUBIC,
-        'LANCZOS': pil.Image.LANCZOS,
-    }.get(RESAMPLE.upper(), pil.Image.LANCZOS)
+def _resample_mode(Image):
+    key = RESAMPLE.upper()
+    # Pillow 10+: enums under Image.Resampling
+    try:
+        Resampling = Image.Resampling
+        mapping = {
+            'NEAREST': Resampling.NEAREST,
+            'BILINEAR': Resampling.BILINEAR,
+            'BICUBIC': Resampling.BICUBIC,
+            'LANCZOS': Resampling.LANCZOS,
+        }
+        return mapping.get(key, mapping['LANCZOS'])
+    except AttributeError:
+        # Older Pillow: enums directly on Image
+        mapping = {
+            'NEAREST': getattr(Image, 'NEAREST', None),
+            'BILINEAR': getattr(Image, 'BILINEAR', None),
+            'BICUBIC': getattr(Image, 'BICUBIC', None),
+            'LANCZOS': getattr(Image, 'LANCZOS', None),
+        }
+        default = mapping.get('LANCZOS') or mapping.get('BICUBIC') or mapping.get('BILINEAR') or mapping.get('NEAREST')
+        return mapping.get(key, default)
 
-# ---- Material graph inspectors ------------------------------
 def _find_principled(nt):
     for n in nt.nodes:
         if n.type == 'BSDF_PRINCIPLED':
@@ -134,7 +117,7 @@ def _find_basecolor_image_node(nt, principled):
     for node in nt.nodes:
         if node.type == 'TEX_IMAGE':
             nm = (node.name or '').lower()
-            if any(k in nm for k in ('base', 'albedo', 'diff', 'color')):
+            if any(k in nm for k in ('base','albedo','diff','color')):
                 return node
     for node in nt.nodes:
         if node.type == 'TEX_IMAGE':
@@ -176,27 +159,22 @@ def _collect_slot_textures(mat):
     normal_img = normal_node.image if normal_node else None
     return (base_img, normal_img)
 
-# ---- Atlas maker --------------------------------------------
 def _build_atlases(slot_images, out_dir, base_name):
     Image, ImageOps = _get_pil()
-
     sizes = []
     for s in slot_images:
         im = Image.open(s['base_path'])
         sizes.append(im.size); im.close()
     max_w = max(w for w,h in sizes); max_h = max(h for w,h in sizes)
     tw = TILE_W or max_w; th = TILE_H or max_h
-
     rows, cols = _choose_layout(len(slot_images))
     W = cols*tw + (cols+1)*PADDING_PX
     H = rows*th + (rows+1)*PADDING_PX
     if FORCE_POW2:
         W = _pow2(W); H = _pow2(H)
-
     atlas_base = Image.new('RGB', (W, H), (20,20,20))
     atlas_norm = Image.new('RGBA', (W, H), (20,20,20,255))
     resample = _resample_mode(Image)
-
     def place(img_path, x, y, canvas, is_normal=False):
         if img_path and os.path.exists(img_path):
             im = Image.open(img_path).convert('RGBA' if is_normal else 'RGB')
@@ -205,7 +183,6 @@ def _build_atlases(slot_images, out_dir, base_name):
         im = im.resize((tw, th), resample=resample)
         canvas.paste(im, (x, y), im if im.mode == 'RGBA' else None)
         im.close()
-
     rects_px = []
     idx = 0
     for r in range(rows):
@@ -219,18 +196,15 @@ def _build_atlases(slot_images, out_dir, base_name):
             place(s.get('normal_path'), x0, y0, atlas_norm, is_normal=True)
             rects_px.append((s['slot_index'], [x0,y0,x1,y1]))
             idx += 1
-
     os.makedirs(out_dir, exist_ok=True)
     base_path = os.path.join(out_dir, f"{base_name}_BaseColor.png")
     norm_path = os.path.join(out_dir, f"{base_name}_Normal.png")
     atlas_base.save(base_path, 'PNG'); atlas_norm.save(norm_path, 'PNG')
-
     rects_uv = {}
     for slot_idx, (x0,y0,x1,y1) in rects_px:
         u0 = x0 / W; u1 = x1 / W
-        v0 = 1.0 - (y1 / H); v1 = 1.0 - (y0 / H)  # flip V
+        v0 = 1.0 - (y1 / H); v1 = 1.0 - (y0 / H)
         rects_uv[slot_idx] = (u0, v0, u1, v1)
-
     manifest = {
         'image_size_px': [W, H],
         'tile_size_px': [tw, th],
@@ -242,7 +216,6 @@ def _build_atlases(slot_images, out_dir, base_name):
         json.dump(manifest, f, indent=2)
     return base_path, norm_path, manifest
 
-# ---- UV remap -----------------------------------------------
 def _remap_uvs_to_atlas(obj, src_uv_name, dst_uv_name, rects_uv_by_slot):
     me = obj.data
     dst = me.uv_layers.get(dst_uv_name) or me.uv_layers.new(name=dst_uv_name)
@@ -250,7 +223,6 @@ def _remap_uvs_to_atlas(obj, src_uv_name, dst_uv_name, rects_uv_by_slot):
     src = me.uv_layers.get(src_uv_name)
     if not src: raise RuntimeError(f"Source UV layer '{src_uv_name}' not found")
     src_data = src.data; dst_data = dst.data
-
     for poly in me.polygons:
         rect = rects_uv_by_slot.get(poly.material_index)
         if not rect:
@@ -262,7 +234,6 @@ def _remap_uvs_to_atlas(obj, src_uv_name, dst_uv_name, rects_uv_by_slot):
             su,sv = src_data[li].uv
             dst_data[li].uv = (u0 + su*du, v0 + sv*dv)
 
-# ---- One-material shader ------------------------------------
 def _create_atlas_material(obj, base_path, norm_path, mat_name):
     mat = bpy.data.materials.new(mat_name); mat.use_nodes = True
     nt = mat.node_tree; nodes, links = nt.nodes, nt.links
@@ -285,62 +256,61 @@ def _create_atlas_material(obj, base_path, norm_path, mat_name):
     links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
     obj.data.materials.clear(); obj.data.materials.append(mat); obj.active_material = mat
 
-# ---- Main ----------------------------------------------------
 def main():
     obj = bpy.context.active_object
     if not obj or obj.type != 'MESH':
         raise RuntimeError('Select a mesh object first (active object must be MESH).')
     if len(obj.data.materials) == 0:
         raise RuntimeError('The active object has no material slots.')
-
-    scene_dir = os.path.dirname(bpy.data.filepath) if bpy.data.is_saved else tempfile.gettempdir()
+    scene_dir = _get_scene_dir()
     out_dir = bpy.path.abspath(OUTPUT_DIR) if OUTPUT_DIR else os.path.join(scene_dir, 'atlas_out')
     base_name = (ATLAS_BASENAME or obj.name).replace(' ', '_')
-
     tmp_dir = os.path.join(out_dir, '_tmp_src'); os.makedirs(tmp_dir, exist_ok=True)
+    Image, ImageOps = _get_pil()
     slot_images = []
     for idx, mat in enumerate(obj.data.materials):
-        if not mat: continue
-        base_img, normal_img = _collect_slot_textures(mat)
-        if not base_img:
-            print(f"[WARN] Slot {idx} '{mat.name}' has no Base Color image; using black.")
-        base_path = _image_to_path(base_img, tmp_dir) if base_img else None
-        normal_path = _image_to_path(normal_img, tmp_dir) if normal_img else None
+        if not mat or not mat.use_nodes or not mat.node_tree:
+            continue
+        nt = mat.node_tree; bsdf = _find_principled(nt)
+        if not bsdf: continue
+        base_node = _find_basecolor_image_node(nt, bsdf)
+        normal_node = _find_normal_image_node(nt, bsdf)
+        base_img = base_node.image if base_node else None
+        normal_img = normal_node.image if normal_node else None
+        def save_img(img):
+            if not img: return None
+            src = _abspath(img.filepath)
+            if src and os.path.exists(src): return src
+            name = (img.name or 'Image').replace('.', '_').replace(' ', '_')
+            path = os.path.join(tmp_dir, f"{name}.png")
+            img.filepath_raw = path; img.file_format = 'PNG'; img.save(); return path
+        base_path = save_img(base_img)
+        normal_path = save_img(normal_img)
         slot_images.append({'slot_index': idx, 'slot_name': mat.name, 'base_path': base_path, 'normal_path': normal_path})
-
     if not slot_images:
         raise RuntimeError('No textures found in material slots (Base Color / Normal).')
-
-    Image, ImageOps = _get_pil()
     base_atlas_path, normal_atlas_path, manifest = _build_atlases(slot_images, out_dir, base_name)
-
     bpy.ops.object.select_all(action='DESELECT'); obj.select_set(True); bpy.context.view_layer.objects.active = obj
     bpy.ops.object.duplicate(); dup = bpy.context.active_object; dup.name = f"{obj.name}_ATLAS"
-
     _create_atlas_material(dup, base_atlas_path, normal_atlas_path, MATERIAL_NAME)
-
     if SRC_UV_NAME:
         src_uv = SRC_UV_NAME
     else:
-        uv_layers = obj.data.uv_layers
-        if len(uv_layers) == 0: raise RuntimeError('The active object has no UV layers.')
+        uvs = obj.data.uv_layers
+        if len(uvs) == 0: raise RuntimeError('The active object has no UV layers.')
         src_uv = None
-        for uv in uv_layers:
+        for uv in uvs:
             if uv.active_render: src_uv = uv.name; break
-        if not src_uv: src_uv = uv_layers.active.name
-
+        if not src_uv: src_uv = uvs.active.name
     _remap_uvs_to_atlas(dup, src_uv, UV_NAME, manifest['rects_uv_by_slot_index'])
-
     try:
         bpy.ops.file.pack_all()
     except Exception as e:
         print('Pack warning:', e)
-
     print(f"[DONE] Created '{dup.name}' with one material and atlases at: {out_dir}")
     print(f"  BaseColor: {base_atlas_path}")
     print(f"  Normal:    {normal_atlas_path}")
     print(f"  UV Map:    {UV_NAME} (mapped by material slot)")
 
 if __name__ == '__main__':
-    Image, ImageOps = _get_pil()
     main()
