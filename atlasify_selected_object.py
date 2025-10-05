@@ -1,8 +1,8 @@
 
-# atlasify_selected_object_v3.py
+# atlasify_selected_object_v4.py
 # Universal no-bake atlas builder with robust per-slot UV detection.
 # - Duplicates ACTIVE object to <name>_ATLAS (single-user mesh)
-# - Builds BaseColor + Normal atlases
+# - Builds BaseColor + Normal + Roughness + Metalness atlases
 # - Creates BAKE_ATLAS UV by remapping from the UV actually used per material slot
 # - Finally assigns a single material wired to the atlases
 
@@ -130,6 +130,30 @@ def _find_normal_image_node(nt, principled):
             except: pass
     return None
 
+def _find_roughness_image_node(nt, principled):
+    """Find the roughness texture node connected to Principled BSDF."""
+    n = _find_image_input_socket_link(nt, principled, 'Roughness')
+    if n: return n
+    # Search by name as fallback
+    for node in nt.nodes:
+        if node.type == 'TEX_IMAGE':
+            nm = (node.name or '').lower()
+            if any(k in nm for k in ('rough', 'glossy', 'gloss')):
+                return node
+    return None
+
+def _find_metalness_image_node(nt, principled):
+    """Find the metalness/metallic texture node connected to Principled BSDF."""
+    n = _find_image_input_socket_link(nt, principled, 'Metallic')
+    if n: return n
+    # Search by name as fallback
+    for node in nt.nodes:
+        if node.type == 'TEX_IMAGE':
+            nm = (node.name or '').lower()
+            if any(k in nm for k in ('metal', 'metallic', 'metalness')):
+                return node
+    return None
+
 def _image_to_path(img, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     if not img: return None
@@ -160,15 +184,26 @@ def _build_atlases(slot_images, out_dir, base_name):
     if FORCE_POW2: W = _pow2(W); H = _pow2(H)
     atlas_base = Image.new('RGB', (W, H), (20,20,20))
     atlas_norm = Image.new('RGBA', (W, H), (20,20,20,255))
+    atlas_rough = Image.new('L', (W, H), 128)  # Grayscale for roughness
+    atlas_metal = Image.new('L', (W, H), 0)    # Grayscale for metalness
     resample = _resample_mode(Image)
 
-    def place(img_path, x, y, canvas, is_normal=False):
+    def place(img_path, x, y, canvas, is_normal=False, is_grayscale=False):
         if img_path and os.path.exists(img_path):
-            im = Image.open(img_path).convert('RGBA' if is_normal else 'RGB')
+            if is_grayscale:
+                im = Image.open(img_path).convert('L')
+            else:
+                im = Image.open(img_path).convert('RGBA' if is_normal else 'RGB')
         else:
-            im = Image.new('RGBA' if is_normal else 'RGB', (tw, th), (128,128,255,255) if is_normal else (0,0,0))
+            if is_grayscale:
+                im = Image.new('L', (tw, th), 128)
+            else:
+                im = Image.new('RGBA' if is_normal else 'RGB', (tw, th), (128,128,255,255) if is_normal else (0,0,0))
         im = im.resize((tw, th), resample=resample)
-        canvas.paste(im, (x, y), im if im.mode == 'RGBA' else None)
+        if is_grayscale:
+            canvas.paste(im, (x, y))
+        else:
+            canvas.paste(im, (x, y), im if im.mode == 'RGBA' else None)
         im.close()
 
     rects_px = []
@@ -182,13 +217,18 @@ def _build_atlases(slot_images, out_dir, base_name):
             s = slot_images[idx]
             place(s['base_path'], x0, y0, atlas_base, is_normal=False)
             place(s.get('normal_path'), x0, y0, atlas_norm, is_normal=True)
+            place(s.get('roughness_path'), x0, y0, atlas_rough, is_grayscale=True)
+            place(s.get('metalness_path'), x0, y0, atlas_metal, is_grayscale=True)
             rects_px.append((s['slot_index'], [x0,y0,x1,y1]))
             idx += 1
 
     os.makedirs(out_dir, exist_ok=True)
     base_path = os.path.join(out_dir, f'{base_name}_BaseColor.png')
     norm_path = os.path.join(out_dir, f'{base_name}_Normal.png')
+    rough_path = os.path.join(out_dir, f'{base_name}_Roughness.png')
+    metal_path = os.path.join(out_dir, f'{base_name}_Metalness.png')
     atlas_base.save(base_path, 'PNG'); atlas_norm.save(norm_path, 'PNG')
+    atlas_rough.save(rough_path, 'PNG'); atlas_metal.save(metal_path, 'PNG')
 
     rects_uv = {}
     for slot_idx, (x0,y0,x1,y1) in rects_px:
@@ -205,7 +245,7 @@ def _build_atlases(slot_images, out_dir, base_name):
     }
     with open(os.path.join(out_dir, f'{base_name}_manifest.json'), 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2)
-    return base_path, norm_path, manifest
+    return base_path, norm_path, rough_path, metal_path, manifest
 
 # -------- UV remap (per-slot source UV) --------
 def _remap_uvs_to_atlas_with_slot_uv(obj, slot_to_src_uv, dst_uv_name, rects_uv_by_slot, poly_slot_index_cache):
@@ -238,26 +278,53 @@ def _remap_uvs_to_atlas_with_slot_uv(obj, slot_to_src_uv, dst_uv_name, rects_uv_
             dst.data[li].uv = (u0 + su*du, v0 + sv*dv)
 
 # -------- One-material shader --------
-def _create_atlas_material(obj, base_path, norm_path, mat_name, uv_name):
+def _create_atlas_material(obj, base_path, norm_path, rough_path, metal_path, mat_name, uv_name):
     mat = bpy.data.materials.new(mat_name); mat.use_nodes = True
     nt = mat.node_tree; nodes, links = nt.nodes, nt.links
     for n in list(nodes): nodes.remove(n)
     out = nodes.new('ShaderNodeOutputMaterial'); out.location = (420, 0)
     bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (140, 0)
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    
+    # Base Color texture
     tex_d = nodes.new('ShaderNodeTexImage'); tex_d.location = (-200, 80)
     tex_d.image = bpy.data.images.load(base_path)
+    
+    # Normal texture
     tex_n = nodes.new('ShaderNodeTexImage'); tex_n.location = (-200, -240)
     tex_n.image = bpy.data.images.load(norm_path)
     try: tex_n.image.colorspace_settings.name = 'Non-Color'
     except: pass
     nmap = nodes.new('ShaderNodeNormalMap'); nmap.location = (20, -240)
+    
+    # Roughness texture
+    tex_r = nodes.new('ShaderNodeTexImage'); tex_r.location = (-200, -400)
+    tex_r.image = bpy.data.images.load(rough_path)
+    try: tex_r.image.colorspace_settings.name = 'Non-Color'
+    except: pass
+    
+    # Metalness texture
+    tex_m = nodes.new('ShaderNodeTexImage'); tex_m.location = (-200, -560)
+    tex_m.image = bpy.data.images.load(metal_path)
+    try: tex_m.image.colorspace_settings.name = 'Non-Color'
+    except: pass
+    
+    # UV Map node
     uv = nodes.new('ShaderNodeUVMap'); uv.location = (-420, -80); uv.uv_map = uv_name
+    
+    # Connect UV to all texture nodes
     links.new(uv.outputs['UV'], tex_d.inputs['Vector'])
     links.new(uv.outputs['UV'], tex_n.inputs['Vector'])
+    links.new(uv.outputs['UV'], tex_r.inputs['Vector'])
+    links.new(uv.outputs['UV'], tex_m.inputs['Vector'])
+    
+    # Connect textures to Principled BSDF
     links.new(tex_d.outputs['Color'], bsdf.inputs['Base Color'])
     links.new(tex_n.outputs['Color'], nmap.inputs['Color'])
     links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+    links.new(tex_r.outputs['Color'], bsdf.inputs['Roughness'])
+    links.new(tex_m.outputs['Color'], bsdf.inputs['Metallic'])
+    
     obj.data.materials.clear(); obj.data.materials.append(mat); obj.active_material = mat
 
 # -------- Main --------
@@ -273,7 +340,7 @@ def main():
     base_name = (ATLAS_BASENAME or obj.name).replace(' ', '_')
     tmp_dir = os.path.join(out_dir, '_tmp_src'); os.makedirs(tmp_dir, exist_ok=True)
 
-    # PER-SLOT: find base + normal images and the UV map name actually used
+    # PER-SLOT: find base + normal + roughness + metalness images and the UV map name actually used
     slot_images = []
     slot_to_src_uv = {}
     for idx, mat in enumerate(obj.data.materials):
@@ -283,23 +350,42 @@ def main():
         if not bsdf: continue
         base_node = _find_basecolor_image_node(nt, bsdf)
         normal_node = _find_normal_image_node(nt, bsdf)
+        roughness_node = _find_roughness_image_node(nt, bsdf)
+        metalness_node = _find_metalness_image_node(nt, bsdf)
+        
         base_img = base_node.image if base_node else None
         normal_img = normal_node.image if normal_node else None
+        roughness_img = roughness_node.image if roughness_node else None
+        metalness_img = metalness_node.image if metalness_node else None
+        
         base_path = _image_to_path(base_img, tmp_dir) if base_img else None
         normal_path = _image_to_path(normal_img, tmp_dir) if normal_img else None
-        if not base_path and not normal_path:
+        roughness_path = _image_to_path(roughness_img, tmp_dir) if roughness_img else None
+        metalness_path = _image_to_path(metalness_img, tmp_dir) if metalness_img else None
+        
+        if not base_path and not normal_path and not roughness_path and not metalness_path:
             # skip empty slots
             continue
-        slot_images.append({'slot_index': idx, 'slot_name': mat.name, 'base_path': base_path, 'normal_path': normal_path})
-        # UV map used by this slot (prefer base's chain, else normal's)
-        uvname = _upstream_uvmap_name(nt, base_node) or _upstream_uvmap_name(nt, normal_node)
+        slot_images.append({
+            'slot_index': idx, 
+            'slot_name': mat.name, 
+            'base_path': base_path, 
+            'normal_path': normal_path,
+            'roughness_path': roughness_path,
+            'metalness_path': metalness_path
+        })
+        # UV map used by this slot (prefer base's chain, else check others)
+        uvname = (_upstream_uvmap_name(nt, base_node) or 
+                  _upstream_uvmap_name(nt, normal_node) or
+                  _upstream_uvmap_name(nt, roughness_node) or
+                  _upstream_uvmap_name(nt, metalness_node))
         slot_to_src_uv[idx] = uvname  # may be None (handled later)
 
     if not slot_images:
-        raise RuntimeError('No usable textures found in material slots (Base Color / Normal).')
+        raise RuntimeError('No usable textures found in material slots (Base Color / Normal / Roughness / Metalness).')
 
     # Build atlases
-    base_atlas_path, normal_atlas_path, manifest = _build_atlases(slot_images, out_dir, base_name)
+    base_atlas_path, normal_atlas_path, rough_atlas_path, metal_atlas_path, manifest = _build_atlases(slot_images, out_dir, base_name)
 
     # Duplicate object (single-user mesh) BEFORE modifying anything
     bpy.ops.object.select_all(action='DESELECT')
@@ -316,7 +402,7 @@ def main():
     _remap_uvs_to_atlas_with_slot_uv(dup, slot_to_src_uv, UV_NAME, manifest['rects_uv_by_slot_index'], poly_slot_index_cache)
 
     # Now assign the single atlas material on the duplicate
-    _create_atlas_material(dup, base_atlas_path, normal_atlas_path, MATERIAL_NAME, UV_NAME)
+    _create_atlas_material(dup, base_atlas_path, normal_atlas_path, rough_atlas_path, metal_atlas_path, MATERIAL_NAME, UV_NAME)
 
     # Pack for convenience
     try: bpy.ops.file.pack_all()
@@ -325,6 +411,8 @@ def main():
     print(f"[DONE] Created '{dup.name}' with one material and atlases at: {out_dir}")
     print(f"  BaseColor: {base_atlas_path}")
     print(f"  Normal:    {normal_atlas_path}")
+    print(f"  Roughness: {rough_atlas_path}")
+    print(f"  Metalness: {metal_atlas_path}")
     print(f"  UV Map:    {UV_NAME} (mapped by material slot)")
 
 if __name__ == '__main__':
